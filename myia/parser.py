@@ -29,8 +29,8 @@ import inspect
 import textwrap
 from typing import Dict, List
 
-from myia.anf_ir import ANFNode, Parameter, Apply, Return, Graph, Constant
-from myia.primops import If, Add
+from myia.anf_ir import ANFNode, Parameter, Apply, Graph, Constant
+from myia.primops import If, Add, Return
 
 RETURNS = []
 
@@ -154,7 +154,7 @@ class Block:
         """
         self.variables[varnum] = node
 
-    def jump(self, target: 'Block') -> Return:
+    def jump(self, target: 'Block') -> Apply:
         """Jumping from one block to the next becomes a tail call.
 
         This method will generate the tail call by calling the graph
@@ -169,11 +169,11 @@ class Block:
         jump = Apply([CONSTANTS[target.graph]], self.graph)
         self.jumps[target] = jump
         target.preds.append(self)
-        return_ = Return(jump, self.graph)
+        return_ = Apply([Constant(Return), jump], self.graph)
         self.graph.return_ = return_
         return return_
 
-    def cond(self, cond: ANFNode, true: 'Block', false: 'Block') -> Return:
+    def cond(self, cond: ANFNode, true: 'Block', false: 'Block') -> Apply:
         """Perform a conditional jump.
 
         This method will generate the call to the if expression and return its
@@ -191,7 +191,7 @@ class Block:
         inputs = [CONSTANTS['if'],
                   cond, CONSTANTS[true.graph], CONSTANTS[false.graph]]
         if_ = Apply(inputs, self.graph)
-        return_ = Return(if_, self.graph)
+        return_ = Apply([Constant(Return), if_], self.graph)
         self.graph.return_ = return_
         return return_
 
@@ -222,7 +222,8 @@ def process_function(block: Block, node: ast.FunctionDef) -> Block:
 
 def process_return(block: Block, node: ast.Return) -> Block:
     """Process a return statement."""
-    return_ = Return(process_expression(block, node.value), block.graph)
+    return_ = Apply([Constant(Return), process_expression(block, node.value)],
+                    block.graph)
     block.graph.return_ = return_
     return_.debug.ast = node
     RETURNS.append(return_)

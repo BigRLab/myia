@@ -30,3 +30,14 @@ class If(Primitive):
     """
 
     pass
+
+
+class Return(Primitive):
+    """Return primtive.
+
+    Each function must end with a call to this primitive, the arguments to
+    which will be the values returned by the function.
+
+    """
+
+    pass
