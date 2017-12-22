@@ -42,6 +42,25 @@ class Graph:
         self.return_: Apply = None
         self.debug = GraphDebug()
 
+    def __str__(self) -> str:
+        """Return a string representation of this graph.
+
+        The debug names of the graph and/or nodes will be used to output
+        something like `f(x, y) → z` if possible.
+
+        """
+        name = self.debug.name if hasattr(self.debug, 'name') else 'func'
+        args = ', '.join(str(parameter) for parameter in self.parameters)
+        if self.return_ and len(self.return_.inputs) > 1:
+            rval = self.return_.inputs[1]
+            if hasattr(rval.debug, 'name'):
+                return_ = rval.debug.name
+            else:
+                return_ = str(self.return_.inputs[1])
+        else:
+            return_ = '?'
+        return f"{name}({args}) → {return_}"
+
 
 class GraphDebug(types.SimpleNamespace):
     """Debug information for a graph.
@@ -90,7 +109,7 @@ class ANFNode(Node):
         self.value = value
         self.graph = graph
         self.uses: Set[Tuple[ANFNode, int]] = set()
-        self.debug = NodeDebug()
+        self.debug = ANFNodeDebug()
 
     @property
     def inputs(self) -> 'Inputs':
@@ -126,7 +145,7 @@ class ANFNode(Node):
         return obj
 
 
-class NodeDebug(types.SimpleNamespace):
+class ANFNodeDebug(types.SimpleNamespace):
     """Debug information for a node.
 
     Any information that is used for debugging e.g. plotting, printing, etc.
@@ -260,6 +279,20 @@ class Apply(ANFNode):
         """Construct an application."""
         super().__init__(inputs, APPLY, graph)
 
+    def __str__(self) -> str:
+        """Return a string representation of this node.
+
+        The debugging `name` attribute will be used to output strings of the
+        form `z = f(x, y)` or `f(x, y)` if possible.
+
+        """
+        inputs = [input_.debug.name if hasattr(input_.debug, 'name')
+                  else str(input_) for input_ in self.inputs]
+        call = f"{inputs[0]}({', '.join(inputs[1:])})"
+        if hasattr(self.debug, 'name'):
+            return f"{self.debug.name} = {call}"
+        return call
+
 
 class Parameter(ANFNode):
     """A parameter to a function.
@@ -273,6 +306,20 @@ class Parameter(ANFNode):
     def __init__(self, graph: Graph) -> None:
         """Construct the parameter."""
         super().__init__([], PARAMETER, graph)
+
+    def __str__(self) -> str:
+        """Return a string representation of this node.
+
+        The debugging `name` attribute will be used to output strings of the
+        form `x` if possible. Otherwise it will default to `arg0` where `0` is
+        in the argument index.
+
+        """
+        if hasattr(self.debug, 'name'):
+            return self.debug.name
+        if self in self.graph.parameters:
+            return f"arg{self.graph.parameters.index(self)}"
+        return "arg"
 
 
 class Constant(ANFNode):
@@ -292,3 +339,11 @@ class Constant(ANFNode):
     def __init__(self, value: Any) -> None:
         """Construct a literal."""
         super().__init__([], value, None)
+
+    def __str__(self) -> str:
+        """Return a string representation of this node.
+
+        The string representation of the value will be used.
+
+        """
+        return str(self.value)

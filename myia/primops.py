@@ -10,7 +10,14 @@ subclass.
 class Primitive:
     """Base class for primitives."""
 
-    pass
+    def __str__(self) -> str:
+        """Return a string representation of the primitive.
+
+        By default a lower case version of the class name will be returned e.g.
+        `add`, `return`, etc.
+
+        """
+        return self.__class__.__name__.lower()
 
 
 class Add(Primitive):

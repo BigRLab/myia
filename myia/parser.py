@@ -35,9 +35,11 @@ from myia.primops import If, Add, Return
 RETURNS = []
 
 CONSTANTS = {
-    'if': Constant(If),
-    ast.Add: Constant(Add)
+    ast.Add: Constant(Add()),
 }
+
+IF_OP = Constant(If())
+RETURN_OP = Constant(Return())
 
 
 class Block:
@@ -169,7 +171,7 @@ class Block:
         jump = Apply([CONSTANTS[target.graph]], self.graph)
         self.jumps[target] = jump
         target.preds.append(self)
-        return_ = Apply([Constant(Return), jump], self.graph)
+        return_ = Apply([RETURN_OP, jump], self.graph)
         self.graph.return_ = return_
         return return_
 
@@ -188,10 +190,9 @@ class Block:
         """
         true.preds.append(self)
         false.preds.append(self)
-        inputs = [CONSTANTS['if'],
-                  cond, CONSTANTS[true.graph], CONSTANTS[false.graph]]
+        inputs = [IF_OP, cond, CONSTANTS[true.graph], CONSTANTS[false.graph]]
         if_ = Apply(inputs, self.graph)
-        return_ = Apply([Constant(Return), if_], self.graph)
+        return_ = Apply([RETURN_OP, if_], self.graph)
         self.graph.return_ = return_
         return return_
 
@@ -222,7 +223,7 @@ def process_function(block: Block, node: ast.FunctionDef) -> Block:
 
 def process_return(block: Block, node: ast.Return) -> Block:
     """Process a return statement."""
-    return_ = Apply([Constant(Return), process_expression(block, node.value)],
+    return_ = Apply([RETURN_OP, process_expression(block, node.value)],
                     block.graph)
     block.graph.return_ = return_
     return_.debug.ast = node
