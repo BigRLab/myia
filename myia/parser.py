@@ -11,12 +11,25 @@ predecessor blocks.
 Note that variable names in this module closely follow the ones used in [1]_ in
 order to make it easy to compare the two algorithms.
 
-The `process_>` functions generally take two arguments: The current
-block, and the AST node to convert to ANF in the context of this block. The
-`process_statement` functions will return the current block at the end of
-processing (which might have changed), whereas `process_expression` functions
-will return the ANF node corresponding to the value of the expression that was
-processed.
+The parsing of Python functions is handled on 3 separate levels, mimicking the
+way that Python resolves variable names (local, globals, builtins):
+
+Global environment
+  There is usually one environment per Python process, although multiple can be
+  instantiated. Within a single environment, the same Python objects will
+  correspond to the same Myia object e.g. if two functions use the same
+  subroutine and are parsed, this subroutine will only be parsed once.
+
+Parser
+  There is one parser per user-defined function. A parser is responsible for
+  e.g. resolving variable names using the function's global scope and managing
+  the parsing process.
+
+Block
+  A single basic block exists for each block of code in a user-defined
+  function. Basic blocks are responsible for resolving variable names locally
+  during parsing and converting Python's imperative control flow structures to
+  a functional representation.
 
 .. [1] Braun, M., Buchwald, S. and Zwinkau, A., 2011. Firm-A graph-based
    intermediate representation. KIT, Fakultät für Informatik.
@@ -25,21 +38,238 @@ processed.
 
 """
 import ast
+import builtins
 import inspect
 import textwrap
-from typing import Dict, List
+from types import FunctionType
+from typing import Any, Dict, List, Tuple, Type
 
 from myia.anf_ir import ANFNode, Parameter, Apply, Graph, Constant
-from myia.primops import If, Add, Return
 
-RETURNS = []
 
-CONSTANTS = {
-    ast.Add: Constant(Add()),
-}
+class Environment:
+    """Environment to parse a function in.
 
-IF_OP = Constant(If())
-RETURN_OP = Constant(Return())
+    An environment consists of a mapping from Python objects to nodes. If a
+    Python object is missing from this mapping, the environment will try to
+    convert it into a Myia object e.g. create a Myia constant or parse a Python
+    function into a myia function.
+
+    The environment is also in charge of resolving variable names that could
+    not be resolved in the function's local and global namespace i.e. for
+    built-ins and for undefined variable names.
+
+    Lastly, the environment has a mapping from AST nodes to Myia nodes that the
+    parser uses e.g. for mapping binary operators to the correct primitives.
+
+    Functions parsed in different environments will share no nodes in common.
+    Functions parsed in the same environment will use the same Myia objects for
+    the same Python objects.
+
+    """
+
+    def __init__(self, object_map: Dict[Any, ANFNode],
+                 ast_map: Dict[Type[ast.AST], ANFNode]) -> None:
+        """Construct an environment."""
+        self.object_map = object_map
+        self.ast_map = ast_map
+
+    def read(self, varnum: str) -> ANFNode:
+        """Read a variable name from the built-ins namespace."""
+        if hasattr(builtins, varnum):
+            return self.object_map[getattr(builtins, varnum)]
+        else:
+            raise ValueError(varnum)
+
+    def map(self, obj: Any) -> ANFNode:
+        """Map a Python object to an ANF node.
+
+        If the object was already converted, the existing Myia node will be
+        returned.
+
+        """
+        if obj in self.object_map:
+            return self.object_map[obj]
+        if isinstance(obj, (float, int, str)):
+            node = Constant(obj)
+            self.object_map[obj] = node
+            return node
+        if isinstance(obj, FunctionType):
+            parser = Parser(self, obj)
+            graph = parser.parse()
+            node = Constant(graph)
+            self.object_map[obj] = node
+            return node
+        raise ValueError(obj)
+
+
+class Parser:
+    """Parser for a function.
+
+    This class handles the parsing of a single user-defined function. It is
+    responsible for handling e.g. globals.
+
+    """
+
+    def __init__(self, environment: Environment,
+                 function: FunctionType) -> None:
+        """Construct a parser."""
+        self.environment = environment
+        self.function = function
+        self.block_map: Dict[Block, Constant] = {}
+
+    def parse(self) -> Graph:
+        """Parse the function into a Myia graph."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(self.function)))
+        function_def = tree.body[0]
+        assert isinstance(function_def, ast.FunctionDef)
+        return self._process_function(None, function_def)[1].graph
+
+    def block_op(self, block: 'Block') -> Constant:
+        """Return node representing the function corresponding to a block."""
+        if block in self.block_map:
+            return self.block_map[block]
+        op = Constant(block.graph)
+        self.block_map[block] = op
+        return op
+
+    def read(self, varnum: str) -> ANFNode:
+        """Read a variable from the function's global namespace."""
+        assert isinstance(self.function, FunctionType)
+        if varnum in self.function.__globals__:
+            return self.environment.map(self.function.__globals__[varnum])
+        return self.environment.read(varnum)
+
+    def process_function(self, block: 'Block',
+                         node: ast.FunctionDef) -> 'Block':
+        """Process a function definition.
+
+        Args:
+            block: Predecessor block (optional). If given, this is a nested
+                function definition.
+            node: The function definition.
+
+        """
+        return self._process_function(block, node)[0]
+
+    def _process_function(self, block: 'Block',
+                          node: ast.FunctionDef) -> Tuple['Block', 'Block']:
+        """Process a function definition and return first and final blocks."""
+        function_block = Block(self)
+        if block:
+            function_block.preds.append(block)
+        function_block.mature()
+        function_block.graph.debug.name = node.name
+        function_block.graph.debug.ast = node
+        for arg in node.args.args:
+            anf_node = Parameter(function_block.graph)
+            anf_node.debug.name = arg.arg
+            anf_node.debug.ast = arg
+            function_block.graph.parameters.append(anf_node)
+            function_block.write(arg.arg, anf_node)
+        final_block = self.process_statements(function_block, node.body)
+        return final_block, function_block
+
+    def process_return(self, block: 'Block', node: ast.Return) -> 'Block':
+        """Process a return statement."""
+        inputs = [self.environment.ast_map[ast.Return],
+                  self.process_expression(block, node.value)]
+        return_ = Apply(inputs, block.graph)
+        block.graph.return_ = return_
+        return_.debug.ast = node
+        return block
+
+    def process_assign(self, block: 'Block', node: ast.Assign) -> 'Block':
+        """Process an assignment."""
+        anf_node = self.process_expression(block, node.value)
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            anf_node.debug.name = node.targets[0].id
+            block.write(node.targets[0].id, anf_node)
+        else:
+            raise NotImplementedError(node.targets)
+        return block
+
+    def process_expression(self, block: 'Block', node: ast.expr) -> ANFNode:
+        """Process an expression."""
+        expr: ANFNode
+        if isinstance(node, ast.BinOp):
+            inputs_: List[ANFNode] = [self.environment.ast_map[type(node.op)],
+                                      self.process_expression(block,
+                                                              node.left),
+                                      self.process_expression(block,
+                                                              node.right)]
+            expr = Apply(inputs_, block.graph)
+            expr.debug.ast = node
+        elif isinstance(node, ast.Name):
+            expr = block.read(node.id)
+        elif isinstance(node, ast.Num):
+            expr = self.environment.map(node.n)
+        return expr
+
+    def process_statements(self, block: 'Block',
+                           nodes: List[ast.stmt]) -> 'Block':
+        """Process a sequence of statements."""
+        for node in nodes:
+            block = self.process_statement(block, node)
+        return block
+
+    def process_statement(self, block: 'Block', node: ast.stmt) -> 'Block':
+        """Process a single statement."""
+        if isinstance(node, ast.Assign):
+            return self.process_assign(block, node)
+        elif isinstance(node, ast.FunctionDef):
+            return self.process_function(block, node)
+        elif isinstance(node, ast.Return):
+            return self.process_return(block, node)
+        elif isinstance(node, ast.If):
+            return self.process_if(block, node)
+        elif isinstance(node, ast.While):
+            return self.process_while(block, node)
+        else:
+            raise NotImplementedError(node)
+
+    def process_if(self, block: 'Block', node: ast.If) -> 'Block':
+        """Process a conditional statement.
+
+        A conditional statement generates 3 functions: The true branch, the
+        false branch, and the continuation.
+
+        """
+        true_block = Block(self)
+        false_block = Block(self)
+        after_block = Block(self)
+        cond = self.process_expression(block, node.test)
+        true_block.mature()
+        false_block.mature()
+        # Process the first branch
+        true_end = self.process_statements(true_block, node.body)
+        true_end.jump(after_block)
+        # And the second
+        false_end = self.process_statements(false_block, node.orelse)
+        false_end.jump(after_block)
+        block.cond(cond, true_block, false_block)
+        after_block.mature()
+        return after_block
+
+    def process_while(self, block: 'Block', node: ast.While) -> 'Block':
+        """Process a while loop.
+
+        A while loop will generate 3 functions: The test, the body, and the
+        continuation.
+
+        """
+        header_block = Block(self)
+        body_block = Block(self)
+        after_block = Block(self)
+        block.jump(header_block)
+        cond = self.process_expression(header_block, node.test)
+        body_block.mature()
+        header_block.cond(cond, body_block, after_block)
+        after_body = self.process_statements(body_block, node.body)
+        after_body.jump(header_block)
+        header_block.mature()
+        after_block.mature()
+        return after_block
 
 
 class Block:
@@ -72,20 +302,21 @@ class Block:
 
     """
 
-    def __init__(self) -> None:
+    def __init__(self, parser: Parser) -> None:
         """Construct a basic block.
 
         Constructing a basic block also constructs a corresponding function,
         and a constant that can be used to call this function.
 
         """
+        self.parser = parser
+
         self.matured: bool = False
         self.variables: Dict[str, ANFNode] = {}
         self.preds: List[Block] = []
         self.phi_nodes: Dict[Parameter, str] = {}
         self.jumps: Dict[Block, Apply] = {}
         self.graph: Graph = Graph()
-        CONSTANTS[self.graph] = Constant(self.graph)
 
     def set_phi_arguments(self, phi: Parameter) -> None:
         """Resolve the arguments to a phi node.
@@ -133,8 +364,11 @@ class Block:
         """
         if varnum in self.variables:
             return self.variables[varnum]
-        if self.matured and len(self.preds) == 1:
-            return self.preds[0].read(varnum)
+        if self.matured:
+            if len(self.preds) == 1:
+                return self.preds[0].read(varnum)
+            elif not self.preds:
+                self.parser.read(varnum)
         phi = Parameter(self.graph)
         self.graph.parameters.append(phi)
         self.phi_nodes[phi] = varnum
@@ -168,10 +402,11 @@ class Block:
             target: The block to jump to from this statement.
 
         """
-        jump = Apply([CONSTANTS[target.graph]], self.graph)
+        jump = Apply([self.parser.block_op(target)], self.graph)
         self.jumps[target] = jump
         target.preds.append(self)
-        return_ = Apply([RETURN_OP, jump], self.graph)
+        inputs = [self.parser.environment.ast_map[ast.Return], jump]
+        return_ = Apply(inputs, self.graph)
         self.graph.return_ = return_
         return return_
 
@@ -190,150 +425,10 @@ class Block:
         """
         true.preds.append(self)
         false.preds.append(self)
-        inputs = [IF_OP, cond, CONSTANTS[true.graph], CONSTANTS[false.graph]]
+        inputs = [self.parser.environment.ast_map[ast.If], cond,
+                  self.parser.block_op(true), self.parser.block_op(false)]
         if_ = Apply(inputs, self.graph)
-        return_ = Apply([RETURN_OP, if_], self.graph)
+        inputs = [self.parser.environment.ast_map[ast.Return], if_]
+        return_ = Apply(inputs, self.graph)
         self.graph.return_ = return_
         return return_
-
-
-def process_function(block: Block, node: ast.FunctionDef) -> Block:
-    """Process a function definition.
-
-    Args:
-        block: Predecessor block (optional). If given, this is a nested
-            function definition.
-        node: The function definition.
-
-    """
-    function_block = Block()
-    if block:
-        function_block.preds.append(block)
-    function_block.mature()
-    function_block.graph.debug.name = node.name
-    function_block.graph.debug.ast = node
-    for arg in node.args.args:
-        anf_node = Parameter(function_block.graph)
-        anf_node.debug.name = arg.arg
-        anf_node.debug.ast = arg
-        function_block.graph.parameters.append(anf_node)
-        function_block.write(arg.arg, anf_node)
-    return process_statements(function_block, node.body)
-
-
-def process_return(block: Block, node: ast.Return) -> Block:
-    """Process a return statement."""
-    return_ = Apply([RETURN_OP, process_expression(block, node.value)],
-                    block.graph)
-    block.graph.return_ = return_
-    return_.debug.ast = node
-    RETURNS.append(return_)
-    return block
-
-
-def process_assign(block: Block, node: ast.Assign) -> Block:
-    """Process an assignment."""
-    anf_node = process_expression(block, node.value)
-    if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-        anf_node.debug.name = node.targets[0].id
-        block.write(node.targets[0].id, anf_node)
-    else:
-        raise NotImplementedError(node.targets)
-    return block
-
-
-def process_expression(block: Block, node: ast.expr) -> ANFNode:
-    """Process an expression."""
-    expr: ANFNode
-    if isinstance(node, ast.BinOp):
-        inputs_: List[ANFNode] = [CONSTANTS[type(node.op)],
-                                  process_expression(block, node.left),
-                                  process_expression(block, node.right)]
-        expr = Apply(inputs_, block.graph)
-        expr.debug.ast = node
-    elif isinstance(node, ast.Name):
-        expr = block.read(node.id)
-    elif isinstance(node, ast.Num):
-        if node.n not in CONSTANTS:
-            CONSTANTS[node.n] = Constant(node.n)
-        expr = CONSTANTS[node.n]
-    return expr
-
-
-def process_statements(block: Block, nodes: List[ast.stmt]) -> Block:
-    """Process a sequence of statements."""
-    for node in nodes:
-        block = process_statement(block, node)
-    return block
-
-
-def process_statement(block: Block, node: ast.stmt) -> Block:
-    """Process a single statement."""
-    if isinstance(node, ast.Assign):
-        return process_assign(block, node)
-    elif isinstance(node, ast.FunctionDef):
-        return process_function(block, node)
-    elif isinstance(node, ast.Return):
-        return process_return(block, node)
-    elif isinstance(node, ast.If):
-        return process_if(block, node)
-    elif isinstance(node, ast.While):
-        return process_while(block, node)
-    else:
-        raise NotImplementedError(node)
-
-
-def process_if(block: Block, node: ast.If) -> Block:
-    """Process a conditional statement.
-
-    A conditional statement generates 3 functions: The true branch, the false
-    branch, and the continuation.
-
-    """
-    true_block = Block()
-    false_block = Block()
-    after_block = Block()
-    cond = process_expression(block, node.test)
-    true_block.mature()
-    false_block.mature()
-
-    # Process the first branch
-    true_end = process_statements(true_block, node.body)
-    true_end.jump(after_block)
-
-    # And the second
-    false_end = process_statements(false_block, node.orelse)
-    false_end.jump(after_block)
-
-    block.cond(cond, true_block, false_block)
-    after_block.mature()
-    return after_block
-
-
-def process_while(block: Block, node: ast.While) -> Block:
-    """Process a while loop.
-
-    A while loop will generate 3 functions: The test, the body, and the
-    continuation.
-
-    """
-    header_block = Block()
-    body_block = Block()
-    after_block = Block()
-
-    block.jump(header_block)
-
-    cond = process_expression(header_block, node.test)
-    body_block.mature()
-    header_block.cond(cond, body_block, after_block)
-    after_body = process_statements(body_block, node.body)
-    after_body.jump(header_block)
-    header_block.mature()
-    after_block.mature()
-    return after_block
-
-
-def parse(func):
-    """Parse a function into ANF."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-    process_statement(None, tree.body[0])

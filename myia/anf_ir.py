@@ -56,7 +56,7 @@ class Graph:
             if hasattr(rval.debug, 'name'):
                 return_ = rval.debug.name
             else:
-                return_ = str(self.return_.inputs[1])
+                return_ = str(rval)
         else:
             return_ = '?'
         return f"{name}({args}) → {return_}"
@@ -312,7 +312,7 @@ class Parameter(ANFNode):
 
         The debugging `name` attribute will be used to output strings of the
         form `x` if possible. Otherwise it will default to `arg0` where `0` is
-        in the argument index.
+        the argument index.
 
         """
         if hasattr(self.debug, 'name'):
